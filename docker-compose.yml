@@ -8,15 +8,34 @@ services:
     ports: [ "9000:9000", "9001:9001" ]
     volumes: [ "minio-data:/data" ]
 
-  hive-metastore:
-    image: bitnami/hive:3
+  mc:
+    image: minio/mc:latest
+    container_name: mc
+    depends_on: [ minio ]
+    entrypoint: [ "sh", "-c", "tail -f /dev/null" ]  # keep running so I can exec into it
     environment:
-      HIVE_METASTORE_DATABASE_HOST: postgres
-      HIVE_METASTORE_DATABASE_NAME: metastore
-      HIVE_METASTORE_DATABASE_USER: hive
-      HIVE_METASTORE_DATABASE_PASSWORD: hive
-    depends_on: [ postgres ]
-    ports: [ "9083:9083" ]
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    volumes:
+      - ./data:/data:ro  # so mc can mirror the local samples/external
+
+  hive-metastore:
+    image: apache/hive:3.1.3
+    container_name: hive-metastore
+    depends_on:
+      - postgres
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./infra/hive/postgres.jar:/opt/hive/lib/postgres.jar:ro
 
   postgres:
     image: postgres:16-alpine
@@ -28,7 +47,7 @@ services:
     volumes: [ "pg-data:/var/lib/postgresql/data" ]
 
   trino:
-    build: ./images/trino
+    build: ./infra/docker/images/trino
     environment:
       - AWS_ACCESS_KEY_ID=minio
       - AWS_SECRET_ACCESS_KEY=minio123
@@ -37,16 +56,32 @@ services:
     depends_on: [ minio, hive-metastore ]
 
   kafka:
-    image: bitnami/kafka:latest
+    image: apache/kafka:3.7.2
+    container_name: kafka
+    depends_on: []
     environment:
-      KAFKA_ENABLE_KRAFT: "yes"
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-    ports: [ "9092:9092" ]
-    volumes: [ "kafka-data:/bitnami/kafka" ]
+      # KRaft single-node (combined broker+controller)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # dev-friendly replication factors for internal topics on single broker
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    ports:
+      - "9094:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
 
   spark:
-    build: ./images/spark
+    build: ./infra/docker/images/spark
     environment:
       - SPARK_MODE=master
       - AWS_ACCESS_KEY_ID=minio
@@ -54,9 +89,12 @@ services:
       - S3_ENDPOINT=http://minio:9000
     ports: [ "4040:4040", "18080:18080" ]
     depends_on: [ minio, hive-metastore ]
+    volumes:
+      - ./:/workspace
+    command: ["bash", "-lc", "tail -f /dev/null"]
 
   airflow:
-    build: ./images/airflow
+    build: ./infra/docker/images/airflow
     environment:
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
@@ -64,7 +102,7 @@ services:
     depends_on: [ spark, trino, kafka ]
 
   superset:
-    build: ./images/superset
+    build: ./infra/docker/images/superset
     ports: [ "8089:8088" ]
     depends_on: [ trino ]
 
@@ -72,7 +110,7 @@ services:
     image: marquezproject/marquez:latest
     environment:
       MARQUEZ_DB_HOST: postgres
-    ports: [ "5000:5000", "3000:3000" ]
+    ports: [ "5000:5000", "3001:3001" ]
     depends_on: [ postgres ]
 
   prometheus:
