@@ -1,0 +1,3 @@
+*.parquet -text filter=lfs diff=lfs merge=lfs
+*.orc     -text filter=lfs diff=lfs merge=lfs
+*.avro    -text filter=lfs diff=lfs merge=lfs
