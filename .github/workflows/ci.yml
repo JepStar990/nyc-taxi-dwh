@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  PYTHON_VERSION: "3.11"
+  SPARK_VERSION: "3.5.1"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff black pytest
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (black)
+        run: black --check .
+
+      - name: Validate Avro contracts exist
+        run: |
+          test -f contracts/schemas/yellow/v2019-2024.avsc
+          test -f contracts/schemas/green/v2019-2024.avsc
+          test -f contracts/schemas/hvfhs/v2019+.avsc
+          test -f contracts/schemas/fhv/v_all.avsc
+
+      - name: Unit-style runtime smoke (syntax + imports)
+        run: |
+          python - <<'PY'
+          import importlib.util, pathlib, sys
+          paths = [
+            "pipelines/ingestion/raw_to_bronze_batch.py",
+            "pipelines/transform/bronze_to_silver.py",
+            "pipelines/transform/silver_to_gold.py",
+            "pipelines/ingestion/stream_to_bronze_spark.py",
+            "pipelines/utils/contracts.py",
+            "pipelines/utils/business_rules.py",
+            "pipelines/utils/dq.py",
+            "pipelines/utils/spark_session.py",
+          ]
+          for p in paths:
+              spec = importlib.util.spec_from_file_location("mod", p)
+              mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+              print("Imported:", p)
+          PY
+
+  build-images:
+    runs-on: ubuntu-latest
+    needs: [checks]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to registry
+        if: env.REGISTRY != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASS }}
+
+      - name: Define image tags
+        id: tags
+        run: |
+          SHA="${GITHUB_SHA::7}"
+          echo "spark=${{ env.REGISTRY }}/nyc-taxi/spark:${SHA}" >> $GITHUB_OUTPUT
+          echo "trino=${{ env.REGISTRY }}/nyc-taxi/trino:${SHA}" >> $GITHUB_OUTPUT
+          echo "superset=${{ env.REGISTRY }}/nyc-taxi/superset:${SHA}" >> $GITHUB_OUTPUT
+          echo "airflow=${{ env.REGISTRY }}/nyc-taxi/airflow:${SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build images
+        run: |
+          docker build -f infra/docker/images/spark/Dockerfile -t $(echo "${{ steps.tags.outputs.spark }}") .
+          docker build -f infra/docker/images/trino/Dockerfile -t $(echo "${{ steps.tags.outputs.trino }}") infra/docker/images/trino
+          docker build -f infra/docker/images/superset/Dockerfile -t $(echo "${{ steps.tags.outputs.superset }}") infra/docker/images/superset
+          docker build -f infra/docker/images/airflow/Dockerfile -t $(echo "${{ steps.tags.outputs.airflow }}") infra/docker/images/airflow
+
+      - name: Push images
+        if: env.REGISTRY != ''
+        run: |
+          docker push $(echo "${{ steps.tags.outputs.spark }}")
+          docker push $(echo "${{ steps.tags.outputs.trino }}")
+          docker push $(echo "${{ steps.tags.outputs.superset }}")
+          docker push $(echo "${{ steps.tags.outputs.airflow }}")
