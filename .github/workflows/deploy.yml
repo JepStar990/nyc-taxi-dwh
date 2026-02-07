@@ -1,0 +1,129 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment to deploy: dev or staging"
+        required: true
+        default: "dev"
+      image_tag:
+        description: "Image tag (short SHA) to deploy"
+        required: true
+
+env:
+  IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+
+jobs:
+  deploy-dev:
+    if: github.event.inputs.env == 'dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write .env for compose (optional override)
+        run: |
+          echo "IMAGE_TAG=${IMAGE_TAG}" > .env || true
+
+      - name: Bring up Dev (Docker Compose)
+        run: |
+          docker compose pull || true
+          docker compose up -d
+
+      - name: Smoke test Trino
+        run: |
+          for i in {1..30}; do
+            curl -sSf http://localhost:8080/ >/dev/null && exit 0 || sleep 5
+          done
+          exit 1
+
+  deploy-staging:
+    if: github.event.inputs.env == 'staging'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Minikube
+        uses: medyagh/setup-minikube@v0.0.14
+        with:
+          kubernetes-version: v1.29.0
+          driver: docker
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helmfile apply
+        run: |
+          helm plugin install https://github.com/roboll/helmfile || true
+          helmfile -f infra/k8s/helmfile.yaml apply
+
+      - name: Smoke test Trino (svc port-forward)
+        run: |
+          kubectl -n dwh get pods
+          kubectl -n dwh port-forward svc/trino 8080:8080 & sleep 5
+          curl -sSf http://localhost:8080/ >/dev/null1~name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment to deploy: dev or staging"
+        required: true
+        default: "dev"
+      image_tag:
+        description: "Image tag (short SHA) to deploy"
+        required: true
+
+env:
+  IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+
+jobs:
+  deploy-dev:
+    if: github.event.inputs.env == 'dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write .env for compose (optional override)
+        run: |
+          echo "IMAGE_TAG=${IMAGE_TAG}" > .env || true
+
+      - name: Bring up Dev (Docker Compose)
+        run: |
+          docker compose pull || true
+          docker compose up -d
+
+      - name: Smoke test Trino
+        run: |
+          for i in {1..30}; do
+            curl -sSf http://localhost:8080/ >/dev/null && exit 0 || sleep 5
+          done
+          exit 1
+
+  deploy-staging:
+    if: github.event.inputs.env == 'staging'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Minikube
+        uses: medyagh/setup-minikube@v0.0.14
+        with:
+          kubernetes-version: v1.29.0
+          driver: docker
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helmfile apply
+        run: |
+          helm plugin install https://github.com/roboll/helmfile || true
+          helmfile -f infra/k8s/helmfile.yaml apply
+
+      - name: Smoke test Trino (svc port-forward)
+        run: |
+          kubectl -n dwh get pods
+          kubectl -n dwh port-forward svc/trino 8080:8080 & sleep 5
+          curl -sSf http://localhost:8080/ >/dev/null
