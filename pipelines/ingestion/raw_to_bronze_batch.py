@@ -3,21 +3,14 @@
 # Usage (from repo root):
 #   ./scripts/spark_submit_local.sh pipelines/ingestion/raw_to_bronze_batch.py
 
-import uuid
+import uuid, argparse
 from pyspark.sql import functions as F, types as T
 from pipelines.utils.spark_session import get_spark
+from pipelines.utils.contracts import validate_all_raw
 
 BRONZE_TABLE = "lake.bronze.trip_records"
 
-# ---------------------------
-# Helpers to standardize dfs
-# ---------------------------
 def with_common_columns(df, service_type: str, source_table: str):
-    """
-    Ensure a complete set of Bronze columns exists and cast to canonical types.
-    Missing columns are added as NULLs.
-    """
-    # Canonical Bronze schema (wide to accommodate all sources)
     cols = {
         "service_type": T.StringType(),
         "pickup_datetime": T.TimestampType(),
@@ -55,107 +48,50 @@ def with_common_columns(df, service_type: str, source_table: str):
         "load_id": T.StringType(),
         "trip_date": T.DateType(),
     }
-
-    # add metadata now
-    df = (
-        df
+    df = (df
         .withColumn("service_type", F.lit(service_type))
         .withColumn("source_table", F.lit(source_table))
         .withColumn("bronze_ingest_time", F.current_timestamp())
         .withColumn("load_id", F.lit(str(uuid.uuid4())))
     )
-
-    # ensure all columns exist with correct types
     for name, dtype in cols.items():
         if name not in df.columns:
             df = df.withColumn(name, F.lit(None).cast(dtype))
         else:
             df = df.withColumn(name, F.col(name).cast(dtype))
-
-    # derive trip_date (from pickup_datetime if present)
-    df = df.withColumn(
-        "trip_date",
-        F.when(F.col("pickup_datetime").isNotNull(), F.to_date("pickup_datetime"))
-         .otherwise(F.to_date(F.current_timestamp()))
-    )
+    df = df.withColumn("trip_date", F.to_date("pickup_datetime"))
     return df.select(*cols.keys())
 
-
 def transform_yellow(df):
-    # Normalize column names/types to canonical fields
-    df = (
-        df
+    df = (df
         .withColumn("pickup_datetime", F.to_timestamp("tpep_pickup_datetime"))
         .withColumn("dropoff_datetime", F.to_timestamp("tpep_dropoff_datetime"))
-        .withColumnRenamed("PULocationID", "PULocationID")
-        .withColumnRenamed("DOLocationID", "DOLocationID")
-        .withColumnRenamed("VendorID", "VendorID")
-        .withColumnRenamed("RatecodeID", "RatecodeID")
-        .withColumnRenamed("payment_type", "payment_type")
-        .withColumnRenamed("store_and_fwd_flag", "store_and_fwd_flag")
-        .withColumnRenamed("passenger_count", "passenger_count")
-        .withColumnRenamed("trip_distance", "trip_distance")
-        .withColumnRenamed("fare_amount", "fare_amount")
-        .withColumnRenamed("extra", "extra")
-        .withColumnRenamed("mta_tax", "mta_tax")
-        .withColumnRenamed("tip_amount", "tip_amount")
-        .withColumnRenamed("tolls_amount", "tolls_amount")
     )
-    # Some columns may not exist (depending on era), guard with coalesce to preserve nulls
     for c in ["improvement_surcharge","congestion_surcharge","airport_fee","ehail_fee","cbd_congestion_fee","total_amount"]:
-        if c not in df.columns:
-            df = df.withColumn(c, F.lit(None))
+        if c not in df.columns: df = df.withColumn(c, F.lit(None))
     return df
-
 
 def transform_green(df):
-    df = (
-        df
+    df = (df
         .withColumn("pickup_datetime", F.to_timestamp("lpep_pickup_datetime"))
         .withColumn("dropoff_datetime", F.to_timestamp("lpep_dropoff_datetime"))
-        .withColumnRenamed("PULocationID", "PULocationID")
-        .withColumnRenamed("DOLocationID", "DOLocationID")
-        .withColumnRenamed("VendorID", "VendorID")
-        .withColumnRenamed("RatecodeID", "RatecodeID")
-        .withColumnRenamed("payment_type", "payment_type")
-        .withColumnRenamed("store_and_fwd_flag", "store_and_fwd_flag")
-        .withColumnRenamed("passenger_count", "passenger_count")
-        .withColumnRenamed("trip_distance", "trip_distance")
-        .withColumnRenamed("fare_amount", "fare_amount")
-        .withColumnRenamed("extra", "extra")
-        .withColumnRenamed("mta_tax", "mta_tax")
-        .withColumnRenamed("tip_amount", "tip_amount")
-        .withColumnRenamed("tolls_amount", "tolls_amount")
     )
-    # trip_type exists on green only
-    if "trip_type" in df.columns:
-        df = df.withColumnRenamed("trip_type", "trip_type")
-    else:
-        df = df.withColumn("trip_type", F.lit(None))
-
+    if "trip_type" not in df.columns: df = df.withColumn("trip_type", F.lit(None))
     for c in ["improvement_surcharge","congestion_surcharge","airport_fee","ehail_fee","cbd_congestion_fee","total_amount"]:
-        if c not in df.columns:
-            df = df.withColumn(c, F.lit(None))
+        if c not in df.columns: df = df.withColumn(c, F.lit(None))
     return df
 
-
 def transform_fhv(df):
-    # FHV has fewer fields; align what we can
     pu = "PUlocationID" if "PUlocationID" in df.columns else "PULocationID"
     do = "DOlocationID" if "DOlocationID" in df.columns else "DOLocationID"
-
-    df = (
-        df
+    df = (df
         .withColumn("pickup_datetime", F.to_timestamp("pickup_datetime"))
         .withColumn("dropoff_datetime", F.to_timestamp(F.coalesce("dropOff_datetime","dropoff_datetime")))
     )
-    for colname, target in [(pu,"PULocationID"), (do,"DOLocationID")]:
-        if colname in df.columns:
-            df = df.withColumnRenamed(colname, target)
-        else:
-            df = df.withColumn(target, F.lit(None))
-
-    # No fares/distances in FHV raw; keep nulls
+    if pu in df.columns: df = df.withColumnRenamed(pu,"PULocationID")
+    else: df = df.withColumn("PULocationID", F.lit(None))
+    if do in df.columns: df = df.withColumnRenamed(do,"DOLocationID")
+    else: df = df.withColumn("DOLocationID", F.lit(None))
     needed_nulls = [
         "passenger_count","trip_distance","fare_amount","extra","mta_tax","improvement_surcharge",
         "tip_amount","tolls_amount","congestion_surcharge","airport_fee","ehail_fee",
@@ -164,71 +100,41 @@ def transform_fhv(df):
         "bcf","sales_tax","base_passenger_fare","request_datetime"
     ]
     for c in needed_nulls:
-        if c not in df.columns:
-            df = df.withColumn(c, F.lit(None))
+        if c not in df.columns: df = df.withColumn(c, F.lit(None))
     return df
 
-
 def transform_hvfhs(df):
-    # Map HVFHS fields to canonical
-    df = (
-        df
+    df = (df
         .withColumn("pickup_datetime", F.to_timestamp("pickup_datetime"))
         .withColumn("dropoff_datetime", F.to_timestamp("dropoff_datetime"))
         .withColumn("request_datetime", F.to_timestamp("request_datetime"))
     )
-
-    # Location IDs (already named PULocationID/DOLocationID in HVFHS)
     for c in ["PULocationID","DOLocationID"]:
-        if c not in df.columns:
-            df = df.withColumn(c, F.lit(None))
-
-    # Distances: trip_miles -> trip_distance
+        if c not in df.columns: df = df.withColumn(c, F.lit(None))
     if "trip_miles" in df.columns:
         df = df.withColumn("trip_distance", F.col("trip_miles").cast("double"))
     else:
         df = df.withColumn("trip_distance", F.lit(None).cast("double"))
-
-    # Financials: compute total_amount since HVFHS doesn't provide directly
     for c in ["base_passenger_fare","tolls","congestion_surcharge","airport_fee","sales_tax","bcf","tips","driver_pay","cbd_congestion_fee"]:
-        if c not in df.columns:
-            df = df.withColumn(c, F.lit(0.0))
-
-    df = (
-        df
+        if c not in df.columns: df = df.withColumn(c, F.lit(0.0))
+    df = (df
         .withColumn("fare_amount", F.col("base_passenger_fare").cast("double"))
         .withColumn("tolls_amount", F.col("tolls").cast("double"))
         .withColumn("tip_amount", F.col("tips").cast("double"))
-        .withColumn("driver_pay", F.col("driver_pay").cast("double"))
-        .withColumn("bcf", F.col("bcf").cast("double"))
-        .withColumn("sales_tax", F.col("sales_tax").cast("double"))
-        .withColumn("cbd_congestion_fee", F.col("cbd_congestion_fee").cast("double"))
-        .withColumn(
+    )
+    if "total_amount" not in df.columns:
+        df = df.withColumn(
             "total_amount",
             (F.col("base_passenger_fare") + F.col("tolls") + F.col("congestion_surcharge")
              + F.col("airport_fee") + F.col("sales_tax") + F.col("bcf") + F.col("tips")).cast("double")
         )
-    )
-
-    # Flags & license
-    if "hvfhs_license_num" not in df.columns:
-        df = df.withColumn("hvfhs_license_num", F.lit(None))
-    if "shared_request_flag" not in df.columns:
-        df = df.withColumn("shared_request_flag", F.lit(None))
-    if "shared_match_flag" not in df.columns:
-        df = df.withColumn("shared_match_flag", F.lit(None))
-
-    # Fill missing optional Taxi columns with NULL
-    for c in ["extra","mta_tax","improvement_surcharge","payment_type","RatecodeID","store_and_fwd_flag","VendorID","airport_fee","ehail_fee"]:
-        if c not in df.columns:
-            df = df.withColumn(c, F.lit(None))
-
+    for c in ["extra","mta_tax","improvement_surcharge","payment_type","RatecodeID","store_and_fwd_flag","VendorID","ehail_fee"]:
+        if c not in df.columns: df = df.withColumn(c, F.lit(None))
     return df
 
-
 def create_bronze_table_if_missing(spark):
-    spark.sql("""
-        CREATE TABLE IF NOT EXISTS lake.bronze.trip_records (
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {BRONZE_TABLE} (
           service_type STRING,
           pickup_datetime TIMESTAMP,
           dropoff_datetime TIMESTAMP,
@@ -270,12 +176,22 @@ def create_bronze_table_if_missing(spark):
     """)
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--validate-only", action="store_true", help="Run contract validation and exit non-zero on violation.")
+    args = parser.parse_args()
+
     spark = get_spark("bronze_raw_standardization")
 
-    # Ensure the Bronze table exists
+    # Contracts gate: validate RAW tables first
+    validate_all_raw(spark, fail_on_violation=args.validate_only)
+
+    if args.validate_only:
+        print("Contracts validation passed.")
+        spark.stop()
+        return
+
     create_bronze_table_if_missing(spark)
 
-    # Read RAW tables (created in Phase 1)
     raw = {
         "yellow": spark.table("lake.raw.yellow"),
         "green":  spark.table("lake.raw.green"),
@@ -283,25 +199,16 @@ def main():
         "fhv":    spark.table("lake.raw.fhv")
     }
 
-    # Transform each dataset to canonical structure
     y = with_common_columns(transform_yellow(raw["yellow"]), "yellow", "lake.raw.yellow")
     g = with_common_columns(transform_green(raw["green"]),   "green",  "lake.raw.green")
     h = with_common_columns(transform_hvfhs(raw["hvfhs"]),   "hvfhs",  "lake.raw.hvfhs")
     f = with_common_columns(transform_fhv(raw["fhv"]),       "fhv",    "lake.raw.fhv")
 
-    # Union and write to Bronze
-    bronze = y.unionByName(g, allowMissingColumns=True)\
-              .unionByName(h, allowMissingColumns=True)\
-              .unionByName(f, allowMissingColumns=True)
-
-    # OPTIONAL sanity filters (drop obvious junk)
+    bronze = y.unionByName(g, allowMissingColumns=True).unionByName(h, allowMissingColumns=True).unionByName(f, allowMissingColumns=True)
     bronze = bronze.filter(F.col("pickup_datetime").isNotNull())
 
-    (bronze
-     .writeTo(BRONZE_TABLE)
-     .append())
+    (bronze.writeTo(BRONZE_TABLE).append())
 
-    # Quick KPI logs (optional)
     counts = bronze.groupBy("service_type").count().orderBy("service_type").collect()
     for row in counts:
         print(f"[BRONZE] {row['service_type']}: {row['count']} rows")

@@ -1,0 +1,27 @@
+# dbt/models/exposures.yml
+version: 2
+
+exposures:
+  - name: core_trip_analysis_dashboard
+    type: dashboard
+    maturity: high
+    url: http://localhost:8088/superset/dashboard/core_trip_analysis
+    description: "Core trip volume, revenue, and flow analysis"
+    depends_on:
+      - ref('fact_trip_detailed')
+      - ref('fact_daily_zone_summary')
+      - ref('fact_hourly_demand')
+    owner:
+      name: Analytics Team
+      email: analytics@example.com
+
+  - name: revenue_decomposition_dashboard
+    type: dashboard
+    maturity: medium
+    url: http://localhost:8088/superset/dashboard/revenue_decomposition
+    description: "Fare component trends and congestion fee impact"
+    depends_on:
+      - ref('fact_revenue_decomposition')
+    owner:
+      name: Finance BI
+      email: finance@example.com

@@ -1,14 +1,14 @@
 # orchestration/airflow/dags/dwh_medallion_daily.py
 from datetime import datetime, timedelta
-import json, os, subprocess
+import json, os
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+import requests
 
-# Config
 DEFAULT_DAYS = int(os.getenv("GOLD_INCREMENTAL_DAYS", "7"))
 DQ_MIN_PASS_RATE = float(os.getenv("DQ_MIN_PASS_RATE", "0.95"))
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")  # optional
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
 
 spark_submit = "/opt/spark/bin/spark-submit"
 spark_conf = [
@@ -22,7 +22,6 @@ spark_conf = [
     "--conf", "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
     "--conf", "spark.hadoop.fs.s3a.access.key="+os.getenv("AWS_ACCESS_KEY_ID","minio"),
     "--conf", "spark.hadoop.fs.s3a.secret.key="+os.getenv("AWS_SECRET_ACCESS_KEY","minio123"),
-    # OpenLineage (emits job & dataset lineage to Marquez)
     "--conf", "spark.openlineage.transport.type=http",
     "--conf", "spark.openlineage.transport.url="+os.getenv("OPENLINEAGE_URL","http://marquez:5000"),
     "--conf", "spark.openlineage.namespace="+os.getenv("OPENLINEAGE_NAMESPACE","nyc-taxi-dwh"),
@@ -31,8 +30,6 @@ spark_conf = [
 default_args = {
     "owner": "data-eng",
     "depends_on_past": False,
-    "email_on_failure": False,
-    "email_on_retry": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=10),
     "sla": timedelta(minutes=60)
@@ -42,7 +39,7 @@ with DAG(
     dag_id="dwh_medallion_daily",
     default_args=default_args,
     start_date=datetime(2025, 1, 1),
-    schedule_interval="0 5 * * *",  # 05:00 UTC daily (adjust for local if needed)
+    schedule_interval="0 5 * * *",
     catchup=False,
     max_active_runs=1,
     tags=["production","medallion","daily"]
@@ -58,78 +55,47 @@ with DAG(
         """
     )
 
+    contracts_validate = BashOperator(
+        task_id="contracts_validate",
+        bash_command=" ".join([spark_submit, *spark_conf, "/workspace/pipelines/ingestion/raw_to_bronze_batch.py", "--validate-only"])
+    )
+
     silver = BashOperator(
         task_id="silver_cleanse_enrich",
-        bash_command=" ".join([
-            spark_submit,
-            *spark_conf,
-            "/workspace/pipelines/transform/bronze_to_silver.py"
-        ])
+        bash_command=" ".join([spark_submit, *spark_conf, "/workspace/pipelines/transform/bronze_to_silver.py"])
     )
 
     gold = BashOperator(
         task_id="gold_star_schema_incremental",
-        bash_command=" ".join([
-            spark_submit,
-            *spark_conf,
-            "/workspace/pipelines/transform/silver_to_gold.py",
-            "--days", str(DEFAULT_DAYS)
-        ])
+        bash_command=" ".join([spark_submit, *spark_conf, "/workspace/pipelines/transform/silver_to_gold.py", "--days", str(DEFAULT_DAYS)])
     )
 
-    def dq_check_and_alert(**context):
-        """
-        Query pass rates from lake.silver._dq_results. If any rule below threshold, post Slack message.
-        We use Trino REST + jq (installed in image).
-        """
-        query = r"""
-        WITH latest AS (
-          SELECT max(run_ts) AS run_ts FROM lake.silver._dq_results
-        )
+    def dq_check_and_alert():
+        q = """
+        WITH latest AS (SELECT max(run_ts) AS run_ts FROM lake.silver._dq_results)
         SELECT rule_name, pass_rate
         FROM lake.silver._dq_results, latest
         WHERE _dq_results.run_ts = latest.run_ts
         ORDER BY rule_name
         """
-        # Post to Trino REST
-        import requests
         trino_url = "http://trino:8080/v1/statement"
-        headers = {"X-Trino-User":"airflow", "Content-Type":"application/json"}
-        payload = {"query": query}
-        r = requests.post(trino_url, headers=headers, data=json.dumps(payload), timeout=60)
-        r.raise_for_status()
+        headers = {"X-Trino-User":"airflow","Content-Type":"application/json"}
+        r = requests.post(trino_url, headers=headers, data=json.dumps({"query":q}), timeout=60); r.raise_for_status()
         data = r.json()
-
-        # Follow Trino nextUri until data arrives
         while "nextUri" in data:
-            r = requests.get(data["nextUri"], timeout=60)
-            r.raise_for_status()
-            data = r.json()
-
+            r = requests.get(data["nextUri"], timeout=60); r.raise_for_status(); data = r.json()
         rows = data.get("data", []) or []
         bad = [(rule, float(rate)) for rule, rate in rows if float(rate) < DQ_MIN_PASS_RATE]
-
         if not bad:
-            print("All DQ rules above threshold.")
-            return
-
+            print("All DQ rules above threshold."); return
         msg = "*DQ Alert* – rules below threshold (min pass rate {:.0%}):\n{}".format(
             DQ_MIN_PASS_RATE, "\n".join([f"- `{r}`: {p:.1%}" for r,p in bad])
         )
         print(msg)
-
         if SLACK_WEBHOOK:
-            try:
-                requests.post(SLACK_WEBHOOK, json={"text": msg}, timeout=10)
-            except Exception as e:
-                print(f"Slack post failed: {e}")
-        else:
-            print("SLACK_WEBHOOK not set; skipping Slack notification.")
+            try: requests.post(SLACK_WEBHOOK, json={"text": msg}, timeout=10)
+            except Exception as e: print(f"Slack post failed: {e}")
 
-    dq_alerts = PythonOperator(
-        task_id="dq_alerts",
-        python_callable=dq_check_and_alert,
-        provide_context=True
-    )
+    dq_alerts = PythonOperator(task_id="dq_alerts", python_callable=dq_check_and_alert)
 
-    wait_services >> silver >> gold >> dq_alerts
+    wait_services >> contracts_validate >> silver >> gold >> dq_alerts
