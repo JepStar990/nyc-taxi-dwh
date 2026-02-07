@@ -34,7 +34,9 @@ RUN mkdir -p /opt/spark/jars && \
 RUN pip install --no-cache-dir \
     apache-airflow-providers-apache-spark==4.7.1 \
     apache-airflow-providers-http==4.6.2 \
-    requests==2.32.3
+    requests==2.32.3 \
+    feast==0.43.1 redis==5.0.1 \
+    apache-airflow-providers-hashicorp==3.7.0
 
 # OpenLineage Airflow integration
 RUN pip install --no-cache-dir openlineage-airflow==1.20.0
