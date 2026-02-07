@@ -110,6 +110,9 @@ services:
       - S3_ENDPOINT=http://minio:9000
       # Optional Slack for DQ alerts (set your real webhook to enable)
       # - SLACK_WEBHOOK=https://hooks.slack.com/services/XXX/YYY/ZZZ
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=myroot
+
     ports: [ "8088:8080" ]
     depends_on: [ spark, trino, kafka, marquez ]
     volumes:
